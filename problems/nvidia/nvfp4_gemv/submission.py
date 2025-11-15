@@ -51,4 +51,6 @@ def custom_kernel(
             out_dtype=torch.float16,
         )
         c_ref[:, 0, l_idx] = res[:, 0]
+    
+    print(c_ref)
     return c_ref

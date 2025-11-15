@@ -10,6 +10,39 @@ using f16 = __half;
 using uint8 = uint8_t;
 using fp8_e4m3 = __nv_fp8_e4m3;
 
+__device__ __forceinline__ void cp_async_16B(void* smem_ptr, const void* gmem_ptr) 
+{
+  uint32_t smem_addr = __cvta_generic_to_shared(smem_ptr);
+  uint64_t gmem_addr = __cvta_generic_to_global(gmem_ptr);
+
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 16;"
+               :: "r"(smem_addr), "l"(gmem_addr) : "memory");
+} 
+
+__device__ __forceinline__ void cp_async_4B(void* smem_ptr, const void* gmem_ptr) 
+{
+  uint32_t smem_addr = __cvta_generic_to_shared(smem_ptr);
+  uint64_t gmem_addr = __cvta_generic_to_global(gmem_ptr);
+
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 4;"
+               :: "r"(smem_addr), "l"(gmem_addr) : "memory");
+} 
+
+__device__ __forceinline__ void cp_async_commit_group()
+{
+  asm volatile("cp.async.commit_group;");
+}
+
+__device__ __forceinline__ void cp_async_wait_group0()
+{
+  asm volatile("cp.async.wait_group 0;");
+}
+
+__device__ __forceinline__ void cp_async_wait_group1()
+{
+  asm volatile("cp.async.wait_group 1;");
+}
+
 // taken from https://github.com/NVIDIA/cutlass/blob/main/include/cutlass/gemm/kernel/gemv_blockscaled.h#L564
 __device__ __forceinline__ f16 blockscaled_multiply_add(
   const Reg32& a0, const Reg32& a1, const Reg32& a2, const Reg32& a3,
@@ -218,10 +251,10 @@ __launch_bounds__(BLOCK_SIZE) __global__ void gemv_kernel(
   const int K,
   const int N)
 {
-  __shared__ uint8 as[BM][BK/2];
-  __shared__ fp8_e4m3 sfas[BM][BK/16];
-  __shared__ uint8 bs[BK/2];
-  __shared__ fp8_e4m3 sfbs[BK/16];
+  __shared__ uint8 as[2][BM][BK/2];
+  __shared__ fp8_e4m3 sfas[2][BM][BK/16];
+  __shared__ uint8 bs[2][BK/2];
+  __shared__ fp8_e4m3 sfbs[2][BK/16];
 
   const int tid = threadIdx.x;
   const int l = blockIdx.y;
@@ -240,46 +273,67 @@ __launch_bounds__(BLOCK_SIZE) __global__ void gemv_kernel(
 
   float accum = 0.0f; // accumulate on float to preserve precision
 
-  for (int k = 0; k < K/BK; k++)
+  cp_async_16B(&as[0][trow][tcol / 2], &a[tcol / 2]);
+  if (tid % 2 == 0)
   {
-    // load in data
-    // all threads load A and sfa
-    reinterpret_cast<Reg128*>(&as[trow][tcol / 2])[0] = 
-      reinterpret_cast<const Reg128*>(&a[tcol / 2])[0];
+    cp_async_4B(&sfas[0][trow][tcol / 16], &sfa[tcol / 16]);
+  }
+  
+  
+  // threads from trow=0 load B and sfb
+  if (trow == 0)
+  {
+    cp_async_16B(&bs[0][tcol / 2], &b[tcol / 2]);
 
-    // every 2 threads load 4 sfa
     if (tid % 2 == 0)
     {
-      reinterpret_cast<Reg32*>(&sfas[trow][tcol / 16])[0] = 
-        reinterpret_cast<const Reg32*>(&sfa[tcol / 16])[0];
+      cp_async_4B(&sfbs[0][tcol / 16], &sfb[tcol / 16]);
     }
-    
-    
-    // threads from trow=0 load B and sfb
-    if (trow == 0)
-    {
-      reinterpret_cast<Reg128*>(&bs[tcol / 2])[0] = 
-        reinterpret_cast<const Reg128*>(&b[tcol / 2])[0];
+  }
+  cp_async_commit_group();
 
+  for (int k = 0; k < K/BK; k++)
+  {
+    // load in next tile
+    if (k + 1 < K / BK)
+    {
+      a += BK/2;
+      b += BK/2;
+      sfa += BK/16;
+      sfb += BK/16;
+
+      cp_async_16B(&as[(k + 1) % 2][trow][tcol / 2], &a[tcol / 2]);
       if (tid % 2 == 0)
       {
-        reinterpret_cast<Reg32*>(&sfbs[tcol / 16])[0] = 
-          reinterpret_cast<const Reg32*>(&sfb[tcol / 16])[0];
+        cp_async_4B(&sfas[(k + 1) % 2][trow][tcol / 16], &sfa[tcol / 16]);
       }
+      
+      // threads from trow=0 load B and sfb
+      if (trow == 0)
+      {
+        cp_async_16B(&bs[(k + 1) % 2][tcol / 2], &b[tcol / 2]);
+
+        if (tid % 2 == 0)
+        {
+          cp_async_4B(&sfbs[(k + 1) % 2][tcol / 16], &sfb[tcol / 16]);
+        }
+      }
+
+      cp_async_commit_group();
+			cp_async_wait_group1();
+    }
+    else
+    {
+      cp_async_wait_group0();
     }
 
     __syncthreads();
 
-    a += BK/2;
-    b += BK/2;
-    sfa += BK/16;
-    sfb += BK/16;
-
     // fma here
-    Reg128 a_reg128 = reinterpret_cast<Reg128*>(&as[trow][tcol / 2])[0];
-    Reg128 b_reg128 = reinterpret_cast<Reg128*>(&bs[tcol / 2])[0];
-    Reg16 sfa_reg = reinterpret_cast<Reg16*>(&sfas[trow][tcol / 16])[0];
-    Reg16 sfb_reg = reinterpret_cast<Reg16*>(&sfbs[tcol / 16])[0];
+    Reg128 a_reg128 = reinterpret_cast<Reg128*>(&as[(k % 2)][trow][tcol / 2])[0];
+    Reg128 b_reg128 = reinterpret_cast<Reg128*>(&bs[(k % 2)][tcol / 2])[0];
+    Reg16 sfa_reg = reinterpret_cast<Reg16*>(&sfas[(k % 2)][trow][tcol / 16])[0];
+    Reg16 sfb_reg = reinterpret_cast<Reg16*>(&sfbs[(k % 2)][tcol / 16])[0];
 
     Reg32* a_reg32_ptr = reinterpret_cast<Reg32*>(&a_reg128);
     Reg32* b_reg32_ptr = reinterpret_cast<Reg32*>(&b_reg128);
@@ -324,7 +378,7 @@ void gemv(
 
   constexpr int TK = 32; // Each thread processes 32 elements along K dimension
   constexpr int BK = 256; // Each block processes 128 elements along K dimension
-  constexpr int BM = 32; // Each block processes 128 elements along M dimension
+  constexpr int BM = 16; // Each block processes 128 elements along M dimension
 
   assert(M % BM == 0); // M must be divisible by BM
   assert(K % BK == 0); // K must be divisible by BK

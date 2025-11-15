@@ -216,10 +216,23 @@ __launch_bounds__(BLOCK_SIZE) __global__ void gemv_kernel(
   const int B,
   const int M,
   const int K,
-  const int N)
+  const int NUM_SF_BLOCKS_PER_K)
 {
+  // Each sf blocks stores scaling factors for 128x64 nvfp4 elemnts
+  constexpr int SF_FP4_ROW = 128;
+  constexpr int SF_FP4_COL = 64;
+
+  assert(BM == SF_FP4_ROW); // BM must equal SF_FP4_ROW for now
+  
+  constexpr int SF_BLOCK_CNT = BK / SF_FP4_COL; // number of scaling blocks a block needs
+
+  // Each sf block's layout is 32x4x4 fp8 elements
+  constexpr int SF_BLOCK_HEIGHT = 32;
+  constexpr int SF_BLOCK_WIDTH = 16;
+  constexpr int SF_SIZE_PER_BLOCK = SF_BLOCK_HEIGHT * SF_BLOCK_WIDTH;
+
   __shared__ uint8 as[BM][BK/2];
-  __shared__ fp8_e4m3 sfas[BM][BK/16];
+  __shared__ fp8_e4m3 sfas[SF_BLOCK_CNT * SF_SIZE_PER_BLOCK];
   __shared__ uint8 bs[BK/2];
   __shared__ fp8_e4m3 sfbs[BK/16];
 
@@ -233,56 +246,106 @@ __launch_bounds__(BLOCK_SIZE) __global__ void gemv_kernel(
   const int trow = tid / THREADS_PER_K;
 
   a += (brow + trow) * K/2;
-  b += l * N * K/2;
+  b += l * K/2;
   c += brow + trow;
-  sfa += (brow + trow) * K/16;
-  sfb += l * N * K/16;
+
+  // scaling factors are of shape (l, rest_m, rest_k, 32, 4, 4)
+  // https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-mma-scale-factor-a-layout-4x
+
+  sfa += (brow / SF_FP4_ROW) * NUM_SF_BLOCKS_PER_K * SF_SIZE_PER_BLOCK;
+  sfb += l * NUM_SF_BLOCKS_PER_K * SF_SIZE_PER_BLOCK;
 
   float accum = 0.0f; // accumulate on float to preserve precision
 
   for (int k = 0; k < K/BK; k++)
   {
     // load in data
-    // all threads load A and sfa
+    // all threads load A
     reinterpret_cast<Reg128*>(&as[trow][tcol / 2])[0] = 
       reinterpret_cast<const Reg128*>(&a[tcol / 2])[0];
-
-    // every 2 threads load 4 sfa
-    if (tid % 2 == 0)
-    {
-      reinterpret_cast<Reg32*>(&sfas[trow][tcol / 16])[0] = 
-        reinterpret_cast<const Reg32*>(&sfa[tcol / 16])[0];
-    }
     
-    
-    // threads from trow=0 load B and sfb
+    // threads from trow=0 load B 
     if (trow == 0)
     {
       reinterpret_cast<Reg128*>(&bs[tcol / 2])[0] = 
         reinterpret_cast<const Reg128*>(&b[tcol / 2])[0];
+    }
 
-      if (tid % 2 == 0)
-      {
-        reinterpret_cast<Reg32*>(&sfbs[tcol / 16])[0] = 
-          reinterpret_cast<const Reg32*>(&sfb[tcol / 16])[0];
-      }
+    // some threads load 2 sf blocks of sfa
+    // each thread can load 16 fp8 elements
+    if (16 * tid < SF_BLOCK_CNT * SF_SIZE_PER_BLOCK)
+    {
+      reinterpret_cast<Reg128*>(&sfas[16 * tid])[0] = 
+        reinterpret_cast<const Reg128*>(&sfa[16 * tid])[0];
+    }
+
+    // only a very few threads load sfb
+    // we just need 4 fp8 out of the entire 128x4 sfb block
+    if (4 * tid < BK / 16)
+    {
+      reinterpret_cast<Reg32*>(&sfbs[4 * tid])[0] = 
+        reinterpret_cast<const Reg32*>(&sfb[tid * SF_SIZE_PER_BLOCK])[0]; // 4 elements at the start of the block
     }
 
     __syncthreads();
 
     a += BK/2;
     b += BK/2;
-    sfa += BK/16;
-    sfb += BK/16;
+    sfa += SF_BLOCK_CNT * SF_SIZE_PER_BLOCK;
+    sfb += SF_BLOCK_CNT * SF_SIZE_PER_BLOCK;
 
     // fma here
     Reg128 a_reg128 = reinterpret_cast<Reg128*>(&as[trow][tcol / 2])[0];
     Reg128 b_reg128 = reinterpret_cast<Reg128*>(&bs[tcol / 2])[0];
-    Reg16 sfa_reg = reinterpret_cast<Reg16*>(&sfas[trow][tcol / 16])[0];
     Reg16 sfb_reg = reinterpret_cast<Reg16*>(&sfbs[tcol / 16])[0];
 
     Reg32* a_reg32_ptr = reinterpret_cast<Reg32*>(&a_reg128);
     Reg32* b_reg32_ptr = reinterpret_cast<Reg32*>(&b_reg128);
+
+    // only tricky part is sfa
+    const int sf_block_idx = tcol / SF_FP4_COL; // which of the 2 sf blocks
+    const int sf_within_block_subcol = (trow / SF_BLOCK_HEIGHT); // which of the 4 subcolumns within the sf block
+    const int sf_within_block_row = trow % SF_BLOCK_HEIGHT; // which of the 32 rows within the sf block
+    const int sf_within_block_col = (tcol / 16) % 4; // which of the 16 columns within the sf block
+
+
+    Reg16 sfa_reg = reinterpret_cast<Reg16*>(&sfas[sf_block_idx * SF_SIZE_PER_BLOCK
+                                                   + sf_within_block_row * SF_BLOCK_WIDTH
+                                                   + sf_within_block_subcol * 4
+                                                   + sf_within_block_col
+                                                  ])[0];
+
+    if (M == 128 && K == 128 && B == 1 && tid < 4 && blockIdx.x == 0) {      
+      uint8_t* a_bytes = reinterpret_cast<uint8_t*>(&a_reg128);
+      printf("[%d]: A reg bytes: {%d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d}\\n", 
+        tid, 
+        a_bytes[0], a_bytes[1], a_bytes[2], a_bytes[3],
+        a_bytes[4], a_bytes[5], a_bytes[6], a_bytes[7],
+        a_bytes[8], a_bytes[9], a_bytes[10], a_bytes[11],
+        a_bytes[12], a_bytes[13], a_bytes[14], a_bytes[15]
+      );
+
+      printf("\\n");
+
+      // print b registers in uint8
+      uint8_t* b_bytes = reinterpret_cast<uint8_t*>(&b_reg128);
+      printf("[%d]: B reg bytes: {%d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d}\\n", 
+        tid,
+        b_bytes[0], b_bytes[1], b_bytes[2], b_bytes[3],
+        b_bytes[4], b_bytes[5], b_bytes[6], b_bytes[7],
+        b_bytes[8], b_bytes[9], b_bytes[10], b_bytes[11],
+        b_bytes[12], b_bytes[13], b_bytes[14], b_bytes[15]
+      );
+
+      printf("\\n");
+
+      // print sfa and sfb as 2 uint8
+      uint8_t* sfa_bytes = reinterpret_cast<uint8_t*>(&sfa_reg);
+      uint8_t* sfb_bytes = reinterpret_cast<uint8_t*>(&sfb_reg);
+
+      printf("[%d]: sfa: %d %d\\n", tid, sfa_bytes[0], sfa_bytes[1]);
+      printf("[%d]: sfb: %d %d\\n", tid, sfb_bytes[0], sfb_bytes[1]);
+    }
 
     f16 res = blockscaled_multiply_add(
                 a_reg32_ptr[0], a_reg32_ptr[1], a_reg32_ptr[2], a_reg32_ptr[3],
@@ -293,12 +356,16 @@ __launch_bounds__(BLOCK_SIZE) __global__ void gemv_kernel(
 
     accum +=  __half2float(res);
               
+    if (M == 128 && K == 128 && B == 1 && tid < 4 && blockIdx.x == 0) {
+      printf("[%d]: accum=%f, res=%f\\n", tid, accum, __half2float(res));
+    }
+
     __syncthreads();
   }
 
   // reduce within threads on the same k
   #pragma unroll
-  for (int offset = 1; offset < THREADS_PER_K; offset <<= 1)
+  for (int offset = 1; offset < THREADS_PER_K; offset *= 2)
   {
     accum += __shfl_xor_sync(0xFFFFFFFF, accum, offset);
   }
@@ -306,9 +373,10 @@ __launch_bounds__(BLOCK_SIZE) __global__ void gemv_kernel(
   // write back result only by the first thread in each K
   if (tcol == 0)
   {
-    c[0] = __float2half_rn(accum);
+    c[trow] = __float2half_rn(accum);
   }
 }
+
 
 void gemv(
   torch::Tensor a, 
@@ -318,13 +386,14 @@ void gemv(
   torch::Tensor c)
 {
   const int M = a.size(0);
-  const int K = a.size(1) * 2; // a is in fp4, so each uint8 contains 2 elements
+  const int K = a.size(1);
   const int B = a.size(2);
-  const int N = b.size(0);
+
+  const int NUM_SF_BLOCKS_PER_K = (K + 15) / 16;
 
   constexpr int TK = 32; // Each thread processes 32 elements along K dimension
-  constexpr int BK = 256; // Each block processes 128 elements along K dimension
-  constexpr int BM = 32; // Each block processes 128 elements along M dimension
+  constexpr int BK = 128; // Each block processes 128 elements along K dimension
+  constexpr int BM = 128; // Each block processes 128 elements along M dimension
 
   assert(M % BM == 0); // M must be divisible by BM
   assert(K % BK == 0); // K must be divisible by BK
@@ -348,6 +417,8 @@ void gemv(
     B,
     M,
     K,
-    N
+    NUM_SF_BLOCKS_PER_K
   );
+
+  cudaDeviceSynchronize();
 }

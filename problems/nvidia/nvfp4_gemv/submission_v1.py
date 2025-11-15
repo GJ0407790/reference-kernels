@@ -1,3 +1,8 @@
+import torch
+from torch.utils.cpp_extension import load_inline
+from task import input_t, output_t
+
+gemv_cuda_src = """
 #include <torch/extension.h>
 
 #include <cuda_fp16.h>
@@ -351,3 +356,58 @@ void gemv(
     N
   );
 }
+"""
+
+gemv_cpp_src = """
+#include <torch/extension.h>
+
+void gemv(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch::Tensor sfb, torch::Tensor c);
+"""
+
+gemv_module = load_inline(
+    name='gemv_cuda',
+    cpp_sources=gemv_cpp_src,
+    cuda_sources=gemv_cuda_src,
+    functions=['gemv'],
+    verbose=True,
+    extra_cuda_cflags=['-gencode=arch=compute_100a,code=sm_100a']
+)
+
+def gemv(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    sfa: torch.Tensor,
+    sfb: torch.Tensor,
+    c: torch.Tensor,
+) -> torch.Tensor:
+    return gemv_module.gemv(
+        a,
+        b,
+        sfa,
+        sfb,
+        c,
+    )
+
+def custom_kernel(data: input_t) -> output_t:
+    """
+    Reference implementation of block-scale fp8 gemv
+    Args:
+        data: Tuple that expands to:
+            a: torch.Tensor[float4e2m1fn] of shape [m, k, l],
+            b: torch.Tensor[float4e2m1fn] of shape [1, k, l],
+            sfa: torch.Tensor[float8_e4m3fnuz] of shape [m, k // 16, l], used by reference implementation
+            sfb: torch.Tensor[float8_e4m3fnuz] of shape [1, k // 16, l], used by reference implementation
+            sfa_permuted: torch.Tensor[float8_e4m3fnuz] of shape [32, 4, rest_m, 4, rest_k, l],
+            sfb_permuted: torch.Tensor[float8_e4m3fnuz] of shape [32, 4, rest_n, 4, rest_k, l],
+            c: torch.Tensor[float16] of shape [m, 1, l]
+    Returns:
+        Tensor containing output in float16
+        c: torch.Tensor[float16] of shape [m, 1, l]
+    """
+    # c: [l, m, 1] is pre-allocated memory to avoid timing allocation overhead.
+    a, b, sfa, sfb, sfa_permuted, sfb_permuted, c = data
+
+    # Your implementation here
+    gemv(a, b, sfa, sfb, c)
+
+    return c
