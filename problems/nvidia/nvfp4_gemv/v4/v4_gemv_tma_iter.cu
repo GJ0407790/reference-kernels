@@ -76,6 +76,7 @@ __device__ __forceinline__ void mbarrier_wait_parity(uint64_t* mbar, const uint3
 
 // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-cp-async-bulk-tensor
 // global -> shared::cluster
+template<const bool no_allocate>
 __device__ __forceinline__ void cp_async_bulk_tensor_2d_global_to_shared(
     uint64_t* dst_shmem, 
     const uint64_t* tensor_map_ptr, 
@@ -90,34 +91,26 @@ __device__ __forceinline__ void cp_async_bulk_tensor_2d_global_to_shared(
   // barrier condition:
   // - leader must arrive (i.e. 1 thread as set above)
   // - TMA hardware substracts bytes from expect_tx counter, must reach zero
-  asm volatile(
-      "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
-      ".mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];" ::"r"(dst_shmem_ptr),
-      "l"(tensor_map_ptr), "r"(offset_x), "r"(offset_y), "r"(mbar_ptr)
-      : "memory");
-}
+  constexpr uint64_t cache_policy_evict_first = 0x1ULL;  // Evict first
+  constexpr uint64_t cache_policy_evict_last = 0x2ULL;   // Evict last (keep in cache)
+  constexpr uint64_t cache_policy_no_allocate = 0x3ULL;   // No allocate
 
-__forceinline__ __device__ void copy_2d_to_shared(
-  void* dst, 
-  const void* tensor_map_ptr, 
-  const size_t chunk_X,
-  const size_t chunk_Y, 
-  const size_t num_bytes,
-  uint64_t* barrier, 
-  const bool is_master_thread) 
-{
-  if (is_master_thread) 
+  if constexpr (no_allocate) 
   {
-    // Initiate bulk tensor copy
-    cp_async_bulk_tensor_2d_global_to_shared(reinterpret_cast<uint64_t *>(dst),
-                                             reinterpret_cast<const uint64_t *>(tensor_map_ptr), 
-                                             chunk_X,
-                                             chunk_Y, 
-                                             barrier);
-
-    // Tell how many bytes are expected to come in.
-    mbarrier_expect_tx(barrier, num_bytes);
+    asm volatile(
+      "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
+      ".mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1, {%2, %3}], [%4], %5;" ::"r"(dst_shmem_ptr),
+      "l"(tensor_map_ptr), "r"(offset_x), "r"(offset_y), "r"(mbar_ptr), "l"(cache_policy_no_allocate)
+      : "memory");
   } 
+  else // evict last
+  {
+    asm volatile(
+        "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
+        ".mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1, {%2, %3}], [%4], %5;" ::"r"(dst_shmem_ptr),
+        "l"(tensor_map_ptr), "r"(offset_x), "r"(offset_y), "r"(mbar_ptr), "l"(cache_policy_evict_last)
+        : "memory");
+  }
 }
 
 void create_2D_tensor_map(
@@ -179,7 +172,7 @@ void create_2D_tensor_map(
 }
 
 // taken from https://github.com/NVIDIA/cutlass/blob/main/include/cutlass/gemm/kernel/gemv_blockscaled.h#L564
-__device__ __forceinline__ f16 blockscaled_multiply_add(
+__device__ f16 blockscaled_multiply_add(
   const Reg32& a0, const Reg32& a1, const Reg32& a2, const Reg32& a3,
   const Reg32& b0, const Reg32& b1, const Reg32& b2, const Reg32& b3,
   const Reg16& sfa,
@@ -371,8 +364,9 @@ __device__ __forceinline__ f16 blockscaled_multiply_add(
 
 template<
   const int BK,
-  const int BM,
-  const int WM,
+  const int BM_PER_ITER,
+  const int WM_ITER,
+  const int SFK,
   const int TK,
   const int BLOCK_SIZE>
 __launch_bounds__(BLOCK_SIZE) __global__ void gemv_kernel(
@@ -383,31 +377,43 @@ __launch_bounds__(BLOCK_SIZE) __global__ void gemv_kernel(
   const __grid_constant__ CUtensorMap tensor_map_sfa,
   const __grid_constant__ CUtensorMap tensor_map_sfb)
 {
-  __shared__ uint8 as[2][BM][BK/2];
-  __shared__ fp8_e4m3 sfas[2][BM][BK/16];
-  __shared__ uint8 bs[2][BK/2];
-  __shared__ alignas(128) fp8_e4m3 sfbs1[BK/16];
-  __shared__ alignas(128) fp8_e4m3 sfbs2[BK/16];
-  __shared__ alignas(16) uint64_t mbarrier[2];
+  constexpr int BM = BM_PER_ITER * WM_ITER;
 
-  fp8_e4m3* sfbs[2] = {sfbs1, sfbs2};
+  constexpr int TMA_XACT_DATA_A_BYTES = BM * BK/2; // for a
+  constexpr int TMA_XACT_DATA_B_BYTES = BK/2; // for b
+  constexpr int TMA_XACT_DATA_BYTES = TMA_XACT_DATA_A_BYTES + TMA_XACT_DATA_B_BYTES; // for a and b
+
+  constexpr int TMA_XACT_SF_A_BYTES = BM * SFK; // for sfas
+  constexpr int TMA_XACT_SF_B_BYTES = SFK; // for sfbs
+  constexpr int TMA_XACT_SF_BYTES = TMA_XACT_SF_A_BYTES + TMA_XACT_SF_B_BYTES; // for sfas and sfbs
+
+  constexpr int TMA_ALL_A_BYTES = TMA_XACT_DATA_A_BYTES + TMA_XACT_SF_A_BYTES;
+  constexpr int TMA_ALL_B_BYTES = TMA_XACT_DATA_B_BYTES + TMA_XACT_SF_B_BYTES;
+  constexpr int TMA_ALL_BYTES = TMA_ALL_A_BYTES + TMA_ALL_B_BYTES;
+
+  // number of K iterations per scaling factor load
+  // in other words, how many iterations before we need to load new scaling factors
+  constexpr int SF_PER_K_ITER = BK / 16;
+  constexpr int SF_K_ITER = SFK / SF_PER_K_ITER;
+
+  __shared__ uint8 as[2][BM][BK/2];
+  __shared__ fp8_e4m3 sfas[2][BM][SFK]; // need WM_ITER buffer because sfa is reused multiple times throughout K loop
+  __shared__ uint8 bs[2][BK/2];
+  __shared__ fp8_e4m3 sfbs[2][SFK];
+  __shared__ uint64_t mbarrier[2];
 
   int parity = 0;
 
   const int tid = threadIdx.x;
-  const bool is_master_thread = (tid == 0);
-  const int l = blockIdx.y;
-  const int m_block = blockIdx.x * BM;
-  const int a_row = l * M + m_block;
-  const int b_row = l * N;
+  const int a_row = blockIdx.y * M + blockIdx.x * BM;
+  const int b_row = blockIdx.y * N;
   int col = 0;
 
   constexpr int THREADS_PER_K = BK / TK;
   const int tcol = (tid % THREADS_PER_K) * TK;
   const int trow = tid / THREADS_PER_K;
 
-  float accum = 0.0f; // accumulate on float to preserve precision
-
+  float accum[WM_ITER] = {0}; // accumulate on float to preserve precision
   c += a_row + trow;
 
   // initialize mbarrier for tma
@@ -419,127 +425,152 @@ __launch_bounds__(BLOCK_SIZE) __global__ void gemv_kernel(
   }
 
   __syncthreads();
+  
+  if (tid == 0)
+  {
+    cp_async_bulk_tensor_2d_global_to_shared<true /*evict_first*/>(
+      reinterpret_cast<uint64_t*>(&as[0][0][0]),
+      reinterpret_cast<const uint64_t*>(&tensor_map_a),
+      0,
+      a_row,
+      &mbarrier[0]);
+    
+    cp_async_bulk_tensor_2d_global_to_shared<false /*evict_first*/>(
+      reinterpret_cast<uint64_t*>(&bs[0][0]),
+      reinterpret_cast<const uint64_t*>(&tensor_map_b),
+      0,
+      b_row,
+      &mbarrier[0]);
+    
+    cp_async_bulk_tensor_2d_global_to_shared<true /*evict_first*/>(
+      reinterpret_cast<uint64_t*>(&sfas[0][0][0]),
+      reinterpret_cast<const uint64_t*>(&tensor_map_sfa),
+      0,
+      a_row,
+      &mbarrier[0]);
+    
+    cp_async_bulk_tensor_2d_global_to_shared<false /*evict_first*/>(
+      reinterpret_cast<uint64_t*>(&sfbs[0][0]),
+      reinterpret_cast<const uint64_t*>(&tensor_map_sfb),
+      0,
+      b_row,
+      &mbarrier[0]);
 
-  copy_2d_to_shared(
-    &as[0][0][0],  //dst
-    &tensor_map_a, //tensor_map_ptr
-    col / 2,     // offset_col
-    a_row,         // offset_row 
-    (BM * BK) / 2, // num_bytes
-    &mbarrier[0],
-    is_master_thread);
-  
-  copy_2d_to_shared(
-    &sfas[0][0][0],  //dst
-    &tensor_map_sfa, //tensor_map_ptr
-    col / 16,        // offset_col
-    a_row,            // offset_row 
-    (BM * BK) / 16,  // num_bytes
-    &mbarrier[0],
-    is_master_thread);
-  
-  copy_2d_to_shared(
-    &bs[0][0],       //dst
-    &tensor_map_b,   //tensor_map_ptr
-    col / 2,       // offset_col
-    b_row,           // offset_row 
-    BK / 2,          // num_bytes
-    &mbarrier[0],
-    is_master_thread);
-  
-  copy_2d_to_shared(
-    &sfbs[0][0],     //dst
-    &tensor_map_sfb, //tensor_map_ptr
-    col / 16,      // offset_col
-    b_row,           // offset_row 
-    BK / 16,         // num_bytes
-    &mbarrier[0],
-    is_master_thread);
-
-  mbarrier_arrive(&mbarrier[0]);
+    mbarrier_arrive_expect_tx(&mbarrier[0], TMA_ALL_BYTES);
+  }
+  else
+  {
+    mbarrier_arrive(&mbarrier[0]);
+  }
 
   for (int k = 0; k < K/BK; k++)
   {
     // load in next tile
     if (k + 1 < K / BK)
     {
-      col += BK;
       const int curr_idx = (k + 1) % 2;
+      col += BK;
 
-      copy_2d_to_shared(
-        &as[curr_idx][0][0],  //dst
-        &tensor_map_a, //tensor_map_ptr
-        col / 2,     // offset_col
-        a_row,         // offset_row 
-        (BM * BK) / 2, // num_bytes
-        &mbarrier[curr_idx],
-        is_master_thread);
-      
-      copy_2d_to_shared(
-        &sfas[curr_idx][0][0],  //dst
-        &tensor_map_sfa, //tensor_map_ptr
-        col / 16,               // offset_col
-        a_row,            // offset_row 
-        (BM * BK) / 16,  // num_bytes
-        &mbarrier[curr_idx],
-        is_master_thread);
-      
-      copy_2d_to_shared(
-        &bs[curr_idx][0],       //dst
-        &tensor_map_b,   //tensor_map_ptr
-        col / 2,       // offset_col
-        b_row,           // offset_row 
-        BK / 2,          // num_bytes
-        &mbarrier[curr_idx],
-        is_master_thread);
-      
-      copy_2d_to_shared(
-        &sfbs[curr_idx][0],     //dst
-        &tensor_map_sfb, //tensor_map_ptr
-        col / 16,      // offset_col
-        b_row,           // offset_row 
-        BK / 16,         // num_bytes
-        &mbarrier[curr_idx],
-        is_master_thread);
-      
-      mbarrier_arrive(&mbarrier[curr_idx]);
+      if (tid == 0)
+      {
+        cp_async_bulk_tensor_2d_global_to_shared<true /*evict_first*/>(
+          reinterpret_cast<uint64_t*>(&as[curr_idx][0][0]),
+          reinterpret_cast<const uint64_t*>(&tensor_map_a),
+          col/2,
+          a_row,
+          &mbarrier[curr_idx]);
+        
+        cp_async_bulk_tensor_2d_global_to_shared<false /*evict_first*/>(
+          reinterpret_cast<uint64_t*>(&bs[curr_idx][0]),
+          reinterpret_cast<const uint64_t*>(&tensor_map_b),
+          col/2,
+          b_row,
+          &mbarrier[curr_idx]);
+        
+        // load scaling factors once in many iterations
+        if ((k + 1) % SF_K_ITER == 0)
+        {
+          const int sf_idx = ((k + 1) / SF_K_ITER) % 2;
+
+          cp_async_bulk_tensor_2d_global_to_shared<true /*evict_first*/>(
+            reinterpret_cast<uint64_t*>(&sfas[sf_idx][0][0]),
+            reinterpret_cast<const uint64_t*>(&tensor_map_sfa),
+            col/16,
+            a_row,
+            &mbarrier[curr_idx]);
+
+          cp_async_bulk_tensor_2d_global_to_shared<false /*evict_first*/>(
+            reinterpret_cast<uint64_t*>(&sfbs[sf_idx][0]),
+            reinterpret_cast<const uint64_t*>(&tensor_map_sfb),
+            col/16,
+            b_row,
+            &mbarrier[curr_idx]);
+          
+          mbarrier_arrive_expect_tx(&mbarrier[curr_idx], TMA_ALL_BYTES);
+        }
+        else
+        {
+          mbarrier_arrive_expect_tx(&mbarrier[curr_idx], TMA_XACT_DATA_BYTES);
+        }
+      }
+      else
+      {
+        mbarrier_arrive(&mbarrier[curr_idx]);
+      }
     }
 
+    // mbarrier_arrive(&mbarrier[curr_iter % 2]);
     parity = (k / 2) % 2;
-    mbarrier_wait_parity(&mbarrier[k%2], parity);
+    mbarrier_wait_parity(&mbarrier[k % 2], parity);
 
     // fma here
-    Reg128 a_reg128 = reinterpret_cast<Reg128*>(&as[(k % 2)][trow][tcol / 2])[0];
+    // load into register once at the start of each WM_ITER
     Reg128 b_reg128 = reinterpret_cast<Reg128*>(&bs[(k % 2)][tcol / 2])[0];
-    Reg16 sfa_reg = reinterpret_cast<Reg16*>(&sfas[(k % 2)][trow][tcol / 16])[0];
-    Reg16 sfb_reg = reinterpret_cast<Reg16*>(&sfbs[(k % 2)][tcol / 16])[0];
-
-    Reg32* a_reg32_ptr = reinterpret_cast<Reg32*>(&a_reg128);
     Reg32* b_reg32_ptr = reinterpret_cast<Reg32*>(&b_reg128);
 
-    f16 res = blockscaled_multiply_add(
-                a_reg32_ptr[0], a_reg32_ptr[1], a_reg32_ptr[2], a_reg32_ptr[3],
-                b_reg32_ptr[0], b_reg32_ptr[1], b_reg32_ptr[2], b_reg32_ptr[3],
-                sfa_reg,
-                sfb_reg
-              );
+    Reg16 sfb_reg = reinterpret_cast<Reg16*>(&sfbs[((k / SF_K_ITER) % 2)][tcol / 16 + (k % SF_K_ITER) * SF_PER_K_ITER])[0];
 
-    accum +=  __half2float(res);
-              
+    #pragma unroll
+    for (int i = 0; i < WM_ITER; i++)
+    {
+      Reg128 a_reg128 = reinterpret_cast<Reg128*>(&as[k % 2][trow + i * BM_PER_ITER][tcol / 2])[0];
+      Reg16 sfa_reg = reinterpret_cast<Reg16*>(&sfas[((k / SF_K_ITER) % 2)][trow + i * BM_PER_ITER][tcol / 16 + (k % SF_K_ITER) * SF_PER_K_ITER])[0];
+
+      Reg32* a_reg32_ptr = reinterpret_cast<Reg32*>(&a_reg128);
+
+      f16 res = blockscaled_multiply_add(
+                  a_reg32_ptr[0], a_reg32_ptr[1], a_reg32_ptr[2], a_reg32_ptr[3],
+                  b_reg32_ptr[0], b_reg32_ptr[1], b_reg32_ptr[2], b_reg32_ptr[3],
+                  sfa_reg,
+                  sfb_reg
+                );
+
+      accum[i] +=  __half2float(res);
+    }
+
     __syncthreads();
   }
 
   // reduce within threads on the same k
   #pragma unroll
-  for (int offset = 1; offset < THREADS_PER_K; offset <<= 1)
+  for (int i = 0; i < WM_ITER; i++)
   {
-    accum += __shfl_xor_sync(0xFFFFFFFF, accum, offset);
+    #pragma unroll
+    for (int offset = 1; offset < THREADS_PER_K; offset <<= 1)
+    {
+      accum[i] += __shfl_xor_sync(0xFFFFFFFF, accum[i], offset);
+    }
   }
+  
 
   // write back result only by the first thread in each K
   if (tcol == 0)
   {
-    c[0] = __float2half_rn(accum);
+    #pragma unroll
+    for (int i = 0; i < WM_ITER; i++)
+    {
+      __stcs(&c[i * BM_PER_ITER], __float2half_rn(accum[i]));    
+    }
   }
 
   // destroy mbarrier
@@ -550,6 +581,10 @@ __launch_bounds__(BLOCK_SIZE) __global__ void gemv_kernel(
   }
 }
 
+template<
+  const int BK,          // Number of elements processed along K dimension
+  const int BM_PER_ITER, // Number of elements processed along M dimension in an iteration
+  const int WM_ITER>     // Number of iterations of warp along M dimension
 void gemv(
   torch::Tensor a, 
   torch::Tensor b,
@@ -562,19 +597,22 @@ void gemv(
   const int B = a.size(2);
   const int N = b.size(0);
 
-  constexpr int TK = 32; // Each thread processes 32 elements along K dimension
-  constexpr int BK = 256; // Each block processes 128 elements along K dimension
-  constexpr int BM = 16; // Each block processes 128 elements along M dimension
+  // Each thread processes 32 elements along K dimension
+  constexpr int TK = 32;
 
+  // Number of scaling factors along K dimension loaded to shared memory
+  // Want to hit 128B for cache line efficiency
+  constexpr int SFK = 128; 
+
+  constexpr int BM = BM_PER_ITER * WM_ITER;
   assert(M % BM == 0); // M must be divisible by BM
-  assert(K % BK == 0); // K must be divisible by BK
 
   constexpr int THREADS_PER_K = BK / TK;
   constexpr int WM = 32 / THREADS_PER_K; // Number of rows per warp
 
-  assert(BM % WM == 0); // BM must be divisible by WM
+  assert(BM_PER_ITER % WM == 0); // BM must be divisible by WM
 
-  constexpr int NUM_WARPS = BM / WM;
+  constexpr int NUM_WARPS = BM_PER_ITER / WM;
   constexpr int BLOCK_SIZE = NUM_WARPS * 32;
   
   const dim3 grid(M / BM, B);
@@ -611,8 +649,8 @@ void gemv(
     B * M,    // global height
     K / 16,   // global width
     BM,       // smem height
-    BK / 16,  // smem width
-    K / 16     // stride in bytes
+    SFK,      // smem width
+    K / 16    // stride in bytes
   );
 
   create_2D_tensor_map(
@@ -621,11 +659,11 @@ void gemv(
     N * B,    // global height
     K / 16,   // global width
     1,        // smem height
-    BK / 16,  // smem width
-    K / 16     // stride in bytes
+    SFK,      // smem width
+    K / 16    // stride in bytes
   );
 
-  gemv_kernel<BK, BM, WM, TK, BLOCK_SIZE><<<grid, BLOCK_SIZE>>>(
+  gemv_kernel<BK, BM_PER_ITER, WM_ITER, SFK, TK, BLOCK_SIZE><<<grid, BLOCK_SIZE>>>(
     reinterpret_cast<f16*>(c.data_ptr<torch::Half>()),
     B,
     M,
@@ -637,3 +675,7 @@ void gemv(
     tensor_map_sfb
   );
 }
+
+template void gemv<256, 16, 1>(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch::Tensor sfb, torch::Tensor c);
+template void gemv<512, 8, 2>(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch::Tensor sfb, torch::Tensor c);
+template void gemv<512, 8, 4>(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch::Tensor sfb, torch::Tensor c);
