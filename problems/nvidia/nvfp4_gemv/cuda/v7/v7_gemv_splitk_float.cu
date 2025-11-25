@@ -1,8 +1,3 @@
-import torch
-from torch.utils.cpp_extension import load_inline
-from task import input_t, output_t
-
-gemv_cuda_src = """
 #include <torch/extension.h>
 
 #include <cudaTypedefs.h>
@@ -81,7 +76,7 @@ __device__ __forceinline__ void mbarrier_wait_parity(uint64_t* mbar, const uint3
 
 // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-cp-async-bulk-tensor
 // global -> shared::cluster
-template<const bool no_allocate>
+template<const int policy>
 __device__ __forceinline__ void cp_async_bulk_tensor_2d_global_to_shared(
     uint64_t* dst_shmem, 
     const uint64_t* tensor_map_ptr, 
@@ -96,25 +91,47 @@ __device__ __forceinline__ void cp_async_bulk_tensor_2d_global_to_shared(
   // barrier condition:
   // - leader must arrive (i.e. 1 thread as set above)
   // - TMA hardware substracts bytes from expect_tx counter, must reach zero
+  constexpr uint64_t cache_policy_evict_normal = 0x0ULL; // Normal caching
   constexpr uint64_t cache_policy_evict_first = 0x1ULL;  // Evict first
   constexpr uint64_t cache_policy_evict_last = 0x2ULL;   // Evict last (keep in cache)
   constexpr uint64_t cache_policy_no_allocate = 0x3ULL;   // No allocate
 
-  if constexpr (no_allocate) 
+  if constexpr (policy == 0) // normal
   {
     asm volatile(
       "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
       ".mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1, {%2, %3}], [%4], %5;" ::"r"(dst_shmem_ptr),
-      "l"(tensor_map_ptr), "r"(offset_x), "r"(offset_y), "r"(mbar_ptr), "l"(cache_policy_no_allocate)
+      "l"(tensor_map_ptr), "r"(offset_x), "r"(offset_y), "r"(mbar_ptr), "l"(cache_policy_evict_normal)
       : "memory");
   } 
-  else // evict last
+  else if constexpr (policy == 1) // evict first
+  {
+    asm volatile(
+      "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
+      ".mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1, {%2, %3}], [%4], %5;" ::"r"(dst_shmem_ptr),
+      "l"(tensor_map_ptr), "r"(offset_x), "r"(offset_y), "r"(mbar_ptr), "l"(cache_policy_evict_first)
+      : "memory");
+  } 
+  else if constexpr (policy == 2) // evict last
   {
     asm volatile(
         "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
         ".mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1, {%2, %3}], [%4], %5;" ::"r"(dst_shmem_ptr),
         "l"(tensor_map_ptr), "r"(offset_x), "r"(offset_y), "r"(mbar_ptr), "l"(cache_policy_evict_last)
         : "memory");
+  }
+  else if constexpr (policy == 3) // no allocate
+  {
+    asm volatile(
+        "cp.async.bulk.tensor.2d.shared::cluster.global.tile"
+        ".mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1, {%2, %3}], [%4], %5;" ::"r"(dst_shmem_ptr),
+        "l"(tensor_map_ptr), "r"(offset_x), "r"(offset_y), "r"(mbar_ptr), "l"(cache_policy_no_allocate)
+        : "memory");
+  }
+  else
+  {
+    // invalid policy
+    static_assert(policy >= 0 && policy <=3, "Invalid cache policy for cp.async bulk tensor");
   }
 }
 
@@ -368,28 +385,30 @@ __device__ f16 blockscaled_multiply_add(
 }
 
 template<
-  const int BK,
+  const int BK_PER_ITER,
+  const int BK_ITER,
   const int BM_PER_ITER,
-  const int WM_ITER,
+  const int BM_ITER,
   const int SFK,
   const int TK,
   const int STAGES,
+  const bool SPLIT_K,
   const int BLOCK_SIZE>
 __launch_bounds__(BLOCK_SIZE) __global__ void gemv_kernel(
-  f16* __restrict__ c,
+  float* __restrict__ c,
   const int B, const int M, const int K, const int N,
   const __grid_constant__ CUtensorMap tensor_map_a,
   const __grid_constant__ CUtensorMap tensor_map_b,
   const __grid_constant__ CUtensorMap tensor_map_sfa,
   const __grid_constant__ CUtensorMap tensor_map_sfb)
 {
-  constexpr int BM = BM_PER_ITER * WM_ITER;
+  constexpr int BM = BM_PER_ITER * BM_ITER;
 
-  constexpr int TMA_XACT_DATA_A_BYTES = BM * BK/2; // for a
-  constexpr int TMA_XACT_DATA_B_BYTES = BK/2; // for b
+  constexpr int TMA_XACT_DATA_A_BYTES = BM_PER_ITER * BK_PER_ITER/2; // for a
+  constexpr int TMA_XACT_DATA_B_BYTES = BK_PER_ITER/2; // for b
   constexpr int TMA_XACT_DATA_BYTES = TMA_XACT_DATA_A_BYTES + TMA_XACT_DATA_B_BYTES; // for a and b
 
-  constexpr int TMA_XACT_SF_A_BYTES = BM * SFK; // for sfas
+  constexpr int TMA_XACT_SF_A_BYTES = BM_PER_ITER * SFK; // for sfas
   constexpr int TMA_XACT_SF_B_BYTES = SFK; // for sfbs
   constexpr int TMA_XACT_SF_BYTES = TMA_XACT_SF_A_BYTES + TMA_XACT_SF_B_BYTES; // for sfas and sfbs
 
@@ -397,34 +416,32 @@ __launch_bounds__(BLOCK_SIZE) __global__ void gemv_kernel(
   constexpr int TMA_ALL_B_BYTES = TMA_XACT_DATA_B_BYTES + TMA_XACT_SF_B_BYTES;
   constexpr int TMA_ALL_BYTES = TMA_ALL_A_BYTES + TMA_ALL_B_BYTES;
 
-  // number of K iterations per scaling factor load
-  // in other words, how many iterations before we need to load new scaling factors
-  constexpr int SF_PER_K_ITER = BK / 16;
-  constexpr int SF_K_ITER = SFK / SF_PER_K_ITER;
-
   __shared__ extern char smem[];
 
   uint8* as = reinterpret_cast<uint8*>(&smem[0]);
-  uint8* bs = &as[STAGES * BM * BK/2];
-  fp8_e4m3* sfas = reinterpret_cast<fp8_e4m3*>(&bs[STAGES * BK/2]);
-  fp8_e4m3* sfbs = &sfas[2 * BM * SFK];
-  uint64_t* mbarrier = reinterpret_cast<uint64_t*>(&sfbs[2 * SFK]);
-
-  int parity = 0;
+  uint8* bs = &as[STAGES * BM_PER_ITER * BK_PER_ITER/2];
+  fp8_e4m3* sfas = reinterpret_cast<fp8_e4m3*>(&bs[BK_PER_ITER/2]);
+  fp8_e4m3* sfbs = &sfas[STAGES * BM_PER_ITER * SFK];
+  uint64_t* mbarrier = reinterpret_cast<uint64_t*>(&sfbs[SFK]);
 
   const int tid = threadIdx.x;
-  const int a_row = blockIdx.y * M + blockIdx.x * BM;
-  const int b_row = blockIdx.y * N;
-  int col = 0;
+  const int a_row = blockIdx.z * M + blockIdx.x * BM;
+  const int b_row = blockIdx.z * N;
+  const int block_col = blockIdx.y * BK_ITER * BK_PER_ITER;
+  int parity = 0;
 
-  constexpr int THREADS_PER_K = BK / TK;
+  constexpr int THREADS_PER_K = BK_PER_ITER / TK;
   const int tcol = (tid % THREADS_PER_K) * TK;
   const int trow = tid / THREADS_PER_K;
 
-  float accum[WM_ITER] = {0}; // accumulate on float to preserve precision
+  // accumulate on float to preserve precision
+  float accum[BM_ITER] = {0}; 
+  // b register is the same throughout BM_ITER
+  Reg128 b_reg128; 
+  Reg16 sfb_reg;
 
   // offset into the correct smem_position
-  as += trow * BK/2 + tcol / 2;
+  as += trow * BK_PER_ITER/2 + tcol / 2;
   bs += tcol / 2;
   sfas += trow * SFK + tcol / 16;
   sfbs += tcol / 16;
@@ -447,136 +464,79 @@ __launch_bounds__(BLOCK_SIZE) __global__ void gemv_kernel(
   __syncthreads();
   
   // prefetch first STAGES - 1 tiles
-  #pragma unroll
-  for (int i = 0; i < STAGES - 1; i++)
+  // STAGES == BM_PER_ITER so will only prefetch on the same column
+  for (int i = 0; i < STAGES; i++)
   {
-    if (col < K)
+    if (tid == 0)
     {
-      if (tid == 0)
+      cp_async_bulk_tensor_2d_global_to_shared<3 /*no_allocate*/>(
+        reinterpret_cast<uint64_t*>(&as[i * BM_PER_ITER * BK_PER_ITER/2]),
+        reinterpret_cast<const uint64_t*>(&tensor_map_a),
+        block_col/2,
+        a_row + i * BM_PER_ITER,
+        &mbarrier[i]);
+
+      cp_async_bulk_tensor_2d_global_to_shared<0 /*evict_normal*/>(
+        reinterpret_cast<uint64_t*>(&sfas[i * BM_PER_ITER * SFK]),
+        reinterpret_cast<const uint64_t*>(&tensor_map_sfa),
+        block_col/16,
+        a_row + i * BM_PER_ITER,
+        &mbarrier[i]);
+      
+      // load b and sfb only in the first BM_ITER
+      if (i == 0)
       {
-        cp_async_bulk_tensor_2d_global_to_shared<true /*evict_first*/>(
-          reinterpret_cast<uint64_t*>(&as[i * BM * BK/2]),
-          reinterpret_cast<const uint64_t*>(&tensor_map_a),
-          col/2,
-          a_row,
-          &mbarrier[i]);
-        
-        cp_async_bulk_tensor_2d_global_to_shared<false /*evict_first*/>(
-          reinterpret_cast<uint64_t*>(&bs[i * BK/2]),
+        cp_async_bulk_tensor_2d_global_to_shared<2 /*evict_last*/>(
+          reinterpret_cast<uint64_t*>(bs),
           reinterpret_cast<const uint64_t*>(&tensor_map_b),
-          col/2,
+          block_col/2,
           b_row,
           &mbarrier[i]);
         
-        if ((i % SF_K_ITER) == 0)
-        {
-          cp_async_bulk_tensor_2d_global_to_shared<true /*evict_first*/>(
-            reinterpret_cast<uint64_t*>(&sfas[0]),
-            reinterpret_cast<const uint64_t*>(&tensor_map_sfa),
-            col/16,
-            a_row,
-            &mbarrier[i]);
-          
-          cp_async_bulk_tensor_2d_global_to_shared<false /*evict_first*/>(
-            reinterpret_cast<uint64_t*>(&sfbs[0]),
-            reinterpret_cast<const uint64_t*>(&tensor_map_sfb),
-            col/16,
-            b_row,
-            &mbarrier[i]);
-          
-          mbarrier_arrive_expect_tx(&mbarrier[i], TMA_ALL_BYTES);
-        }
-        else
-        {
-          // only data bytes
-          mbarrier_arrive_expect_tx(&mbarrier[i], TMA_XACT_DATA_BYTES);
-        }
-
-        col += BK;
+        cp_async_bulk_tensor_2d_global_to_shared<2 /*evict_last*/>(
+          reinterpret_cast<uint64_t*>(sfbs),
+          reinterpret_cast<const uint64_t*>(&tensor_map_sfb),
+          block_col/16,
+          b_row,
+          &mbarrier[i]);
+        
+        mbarrier_arrive_expect_tx(&mbarrier[i], TMA_ALL_BYTES);
       }
       else
       {
-        // non first thread
-        mbarrier_arrive(&mbarrier[i]);
+        mbarrier_arrive_expect_tx(&mbarrier[i], TMA_ALL_A_BYTES);
       }
+    }
+    else
+    {
+      // non first thread
+      mbarrier_arrive(&mbarrier[i]);
     }
   }
 
-  for (int k = 0; k < K/BK; k++)
+  for (int k = 0; (k < BK_ITER) && (block_col + k * BK_PER_ITER < K); k++)
   {
-    // load in next tile
-    if (k + STAGES - 1 < K / BK)
+    // start inner loop for a and sfa
+    for (int i = 0; i < BM_ITER; i++)
     {
-      const int next_idx = (k + STAGES - 1) % STAGES;
+      // const int curr_iter = k * BM_ITER + i;
+      // because STAGES == BM_PER_ITER, curr_iter % STAGES == i
+      // hence we can use i directly
+      mbarrier_wait_parity(&mbarrier[i], parity);
+
+      // fma here
+      // Load b once into the registers
+      // then load into registers
+      if (i == 0)
+      {
+        b_reg128 = reinterpret_cast<Reg128*>(bs)[0];
+        sfb_reg = reinterpret_cast<Reg16*>(sfbs)[0];
+      }
       
-      if (tid == 0)
-      {
-        cp_async_bulk_tensor_2d_global_to_shared<true /*evict_first*/>(
-          reinterpret_cast<uint64_t*>(&as[next_idx * BM * BK/2]),
-          reinterpret_cast<const uint64_t*>(&tensor_map_a),
-          col/2,
-          a_row,
-          &mbarrier[next_idx]);
+      Reg128 a_reg128 = reinterpret_cast<Reg128*>(&as[i * BM_PER_ITER * BK_PER_ITER/2])[0];
+      Reg16 sfa_reg = reinterpret_cast<Reg16*>(&sfas[i * BM_PER_ITER * SFK])[0];
 
-        cp_async_bulk_tensor_2d_global_to_shared<false /*evict_first*/>(
-          reinterpret_cast<uint64_t*>(&bs[next_idx * BK/2]),
-          reinterpret_cast<const uint64_t*>(&tensor_map_b),
-          col/2,
-          b_row,
-          &mbarrier[next_idx]);
-        
-        // load scaling factors once in many iterations
-        if ((k + STAGES - 1) % SF_K_ITER == 0)
-        {
-          const int sf_idx = ((k + STAGES - 1) / SF_K_ITER) % 2;
-
-          cp_async_bulk_tensor_2d_global_to_shared<true /*evict_first*/>(
-            reinterpret_cast<uint64_t*>(&sfas[sf_idx * BM * SFK]),
-            reinterpret_cast<const uint64_t*>(&tensor_map_sfa),
-            col/16,
-            a_row,
-            &mbarrier[next_idx]);
-
-          cp_async_bulk_tensor_2d_global_to_shared<false /*evict_first*/>(
-            reinterpret_cast<uint64_t*>(&sfbs[sf_idx * SFK]),
-            reinterpret_cast<const uint64_t*>(&tensor_map_sfb),
-            col/16,
-            b_row,
-            &mbarrier[next_idx]);
-          
-          mbarrier_arrive_expect_tx(&mbarrier[next_idx], TMA_ALL_BYTES);
-        }
-        else
-        {
-          mbarrier_arrive_expect_tx(&mbarrier[next_idx], TMA_XACT_DATA_BYTES);
-        }
-
-        col += BK;
-      }
-      else
-      {
-        mbarrier_arrive(&mbarrier[next_idx]);
-      }
-    }
-
-    parity = (k / STAGES) % 2;
-    mbarrier_wait_parity(&mbarrier[k % STAGES], parity);
-
-    // fma here
-    // load into register once at the start of each WM_ITER
-    const int curr_data_idx = k % STAGES;
-    const int curr_sf_idx = (k / SF_K_ITER) % 2;
-    Reg128 b_reg128 = reinterpret_cast<Reg128*>(&bs[curr_data_idx * BK / 2])[0];
-    Reg32* b_reg32_ptr = reinterpret_cast<Reg32*>(&b_reg128);
-
-    Reg16 sfb_reg = reinterpret_cast<Reg16*>(&sfbs[curr_sf_idx * SFK + (k % SF_K_ITER) * SF_PER_K_ITER])[0];
-
-    #pragma unroll
-    for (int i = 0; i < WM_ITER; i++)
-    {
-      Reg128 a_reg128 = reinterpret_cast<Reg128*>(&as[(curr_data_idx * BM + i * BM_PER_ITER) * BK / 2])[0];
-      Reg16 sfa_reg = reinterpret_cast<Reg16*>(&sfas[(curr_sf_idx * BM + i * BM_PER_ITER) * SFK + (k % SF_K_ITER) * SF_PER_K_ITER])[0];
-
+      Reg32* b_reg32_ptr = reinterpret_cast<Reg32*>(&b_reg128);
       Reg32* a_reg32_ptr = reinterpret_cast<Reg32*>(&a_reg128);
 
       f16 res = blockscaled_multiply_add(
@@ -587,14 +547,64 @@ __launch_bounds__(BLOCK_SIZE) __global__ void gemv_kernel(
                 );
 
       accum[i] +=  __half2float(res);
-    }
 
-    __syncthreads();
+      __syncthreads();
+
+      // prefetch next tile
+      const int next_iter = curr_iter + STAGES;
+
+      if (next_iter < BK_ITER * BM_ITER)
+      {
+        const int next_i = next_iter % BM_ITER;
+        const int next_k = next_iter / BM_ITER;
+        const int next_col = block_col + next_k * BK_PER_ITER;
+
+        if (next_col < K)
+        {
+          if (tid == 0)
+          {
+            cp_async_bulk_tensor_2d_global_to_shared<3 /*no_allocate*/>(
+              reinterpret_cast<uint64_t*>(&as[next_i * BM_PER_ITER * BK_PER_ITER/2]),
+              reinterpret_cast<const uint64_t*>(&tensor_map_a),
+              next_col/2,
+              a_row + next_i * BM_PER_ITER,
+              &mbarrier[next_i]);
+
+            if (next_i == 0)
+            {
+              cp_async_bulk_tensor_2d_global_to_shared<2 /*evict_last*/>(
+                reinterpret_cast<uint64_t*>(bs),
+                reinterpret_cast<const uint64_t*>(&tensor_map_b),
+                next_col/2,
+                b_row,
+                &mbarrier[next_i]);
+              
+              mbarrier_arrive_expect_tx(&mbarrier[next_i], TMA_XACT_DATA_BYTES);
+            }
+            else
+            {
+              mbarrier_arrive_expect_tx(&mbarrier[next_i], TMA_XACT_DATA_A_BYTES);
+            }
+          }
+          else
+          {
+            mbarrier_arrive(&mbarrier[next_i]);
+          }
+        }
+      }
+    } // end of BM_ITER
+
+    // move to next sfb tile
+    sfbs += BK_PER_ITER / 16; 
+    sfas += BK_PER_ITER / 16;
+
+    // toggle parity for mbarrier
+    parity ^= 1;
   }
 
   // reduce within threads on the same k
   #pragma unroll
-  for (int i = 0; i < WM_ITER; i++)
+  for (int i = 0; i < BM_ITER; i++)
   {
     #pragma unroll
     for (int offset = 1; offset < THREADS_PER_K; offset <<= 1)
@@ -608,25 +618,35 @@ __launch_bounds__(BLOCK_SIZE) __global__ void gemv_kernel(
   if (tcol == 0)
   {
     #pragma unroll
-    for (int i = 0; i < WM_ITER; i++)
+    for (int i = 0; i < BM_ITER; i++)
     {
-      __stcs(&c[i * BM_PER_ITER], __float2half_rn(accum[i]));    
+      if constexpr (SPLIT_K)
+      {
+        atomicAdd(&c[i * BM_PER_ITER], accum[i]);
+      }
+      else
+      {
+        __stcs(&c[i * BM_PER_ITER], accum[i]);    
+      }
     }
   }
 
   // destroy mbarrier
   if (tid == 0)
   {
-    mbarrier_invalid(&mbarrier[0]);
-    mbarrier_invalid(&mbarrier[1]);
+    #pragma unroll
+    for (int i = 0; i < STAGES; i++)
+    {
+      mbarrier_invalid(&mbarrier[i]);
+    }
   }
 }
 
 template<
-  const int BK,          // Number of elements processed along K dimension
+  const int BK_PER_ITER, // Number of elements processed along K dimension in an iteration
+  const int BK_ITER,     // Number of iterations along K dimension
   const int BM_PER_ITER, // Number of elements processed along M dimension in an iteration
-  const int WM_ITER,     // Number of iterations of warp along M dimension
-  const int STAGES>      // Number of stages in the pipeline
+  const int BM_ITER>     // Number of iterations along M dimension
 void gemv(
   torch::Tensor a, 
   torch::Tensor b,
@@ -642,14 +662,17 @@ void gemv(
   // Each thread processes 32 elements along K dimension
   constexpr int TK = 32;
 
+  // ensure we have enough scaling factors since we only load in 128 of them
+  constexpr int BK = BK_PER_ITER * BK_ITER;
+
   // Number of scaling factors along K dimension loaded to shared memory
   // Want to hit 128B for cache line efficiency
-  constexpr int SFK = 128; 
+  constexpr int SFK = BK / 16;
 
-  constexpr int BM = BM_PER_ITER * WM_ITER;
+  constexpr int BM = BM_PER_ITER * BM_ITER;
   assert(M % BM == 0); // M must be divisible by BM
 
-  constexpr int THREADS_PER_K = BK / TK;
+  constexpr int THREADS_PER_K = BK_PER_ITER / TK;
   constexpr int WM = 32 / THREADS_PER_K; // Number of rows per warp
 
   assert(BM_PER_ITER % WM == 0); // BM must be divisible by WM
@@ -657,7 +680,8 @@ void gemv(
   constexpr int NUM_WARPS = BM_PER_ITER / WM;
   constexpr int BLOCK_SIZE = NUM_WARPS * 32;
   
-  const dim3 grid(M / BM, B);
+  const int NUM_BLOCKS_IN_K = (K - 1) / BK + 1;
+  const dim3 grid(M / BM, NUM_BLOCKS_IN_K, B);
 
   // Tensormaps
   alignas(64) CUtensorMap tensor_map_a{};
@@ -668,144 +692,88 @@ void gemv(
   create_2D_tensor_map(
     tensor_map_a,
     a.data_ptr(),
-    B * M,  // global height
-    K / 2,  // global width
-    BM,     // smem height
-    BK / 2, // smem width
-    K / 2   // stride in bytes
+    B*M,           // global height
+    K/2,           // global width
+    BM_PER_ITER,   // smem height
+    BK_PER_ITER/2, // smem width
+    K/2            // stride in bytes
   );
 
   create_2D_tensor_map(
     tensor_map_b,
     b.data_ptr(),
-    N * B,  // global height
-    K / 2,  // global width
-    1,      // smem height
-    BK / 2, // smem width
-    K / 2   // stride in bytes
+    N*B,           // global height
+    K/2,           // global width
+    1,             // smem height
+    BK_PER_ITER/2, // smem width
+    K/2            // stride in bytes
   );
 
   create_2D_tensor_map(
     tensor_map_sfa,
     sfa.data_ptr(),
-    B * M,    // global height
-    K / 16,   // global width
-    BM,       // smem height
-    SFK,      // smem width
-    K / 16    // stride in bytes
+    B*M,         // global height
+    K/16,        // global width
+    BM_PER_ITER, // smem height
+    SFK,         // smem width
+    K/16         // stride in bytes
   );
 
   create_2D_tensor_map(
     tensor_map_sfb,
     sfb.data_ptr(),
-    N * B,    // global height
-    K / 16,   // global width
-    1,        // smem height
-    SFK,      // smem width
-    K / 16    // stride in bytes
+    N*B,        // global height
+    K/16,       // global width
+    1,          // smem height
+    SFK,        // smem width
+    K/16        // stride in bytes
   );
 
-  constexpr size_t SMEM_DATA = STAGES * ((BM * BK/2) + (BK/2)); // a + b
-  constexpr size_t SMEM_SF = 2 * ((BM * SFK) + (SFK));          // sfa + sfb
-  constexpr size_t SMEM_BARRIER = STAGES * sizeof(uint64_t);    // mbarriers
+  // a and b have different stages
+  // b/sfb is reused BM_ITER times
+  constexpr int STAGES = BM_ITER; // let stages enough for inner loop BM_ITER
+
+  constexpr size_t SMEM_DATA = STAGES * (BM_PER_ITER * BK_PER_ITER/2) + BK_PER_ITER/2;   // a + b
+  constexpr size_t SMEM_SF = STAGES * (BM_PER_ITER * SFK) + SFK;                // sfa + sfb
+  constexpr size_t SMEM_BARRIER = STAGES * sizeof(uint64_t);                    // mbarriers
   constexpr size_t SMEM_SIZE = SMEM_DATA + SMEM_SF + SMEM_BARRIER;
 
-  if (SMEM_SIZE > 48 * 1024 * 1024)
+  auto launch_kernel = [&](auto split_k_val) 
   {
-    cudaFuncSetAttribute(
-      gemv_kernel<BK, BM_PER_ITER, WM_ITER, SFK, TK, STAGES, BLOCK_SIZE>,
-      cudaFuncAttributeMaxDynamicSharedMemorySize,
-      SMEM_SIZE
+    constexpr bool SPLIT_K = decltype(split_k_val)::value;
+
+    // Define the specific kernel specialization
+    auto kernel = gemv_kernel<BK_PER_ITER, BK_ITER, BM_PER_ITER, BM_ITER, 
+                              SFK, TK, STAGES, SPLIT_K, BLOCK_SIZE>;
+
+    // Handle the attribute setting inside the single path
+    if (SMEM_SIZE > 48 * 1024) 
+    {
+      cudaFuncSetAttribute(
+        kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        SMEM_SIZE
+      );
+    }
+
+    // Launch
+    kernel<<<grid, BLOCK_SIZE, SMEM_SIZE>>>(
+        c.data_ptr<float>(),
+        B, M, K, N,
+        tensor_map_a, tensor_map_b, tensor_map_sfa, tensor_map_sfb
     );
+  };
+
+  // Dispatch based on runtime variable NUM_BLOCKS_IN_K
+  if (NUM_BLOCKS_IN_K > 1) 
+  {
+    launch_kernel(std::true_type{});
+  } 
+  else 
+  {
+    launch_kernel(std::false_type{});
   }
-
-  gemv_kernel<BK, BM_PER_ITER, WM_ITER, SFK, TK, STAGES, BLOCK_SIZE><<<grid, BLOCK_SIZE, SMEM_SIZE>>>(
-    reinterpret_cast<f16*>(c.data_ptr<torch::Half>()),
-    B,
-    M,
-    K,
-    N,
-    tensor_map_a,
-    tensor_map_b,
-    tensor_map_sfa,
-    tensor_map_sfb
-  );
 }
 
-template void gemv<256, 16, 1, 2>(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch::Tensor sfb, torch::Tensor c);
-template void gemv<512, 8, 4, 4>(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch::Tensor sfb, torch::Tensor c);
-"""
-
-gemv_cpp_src = """
-#include <torch/extension.h>
-
-template<const int BK, const int BM_PER_ITER, const int WM_ITER, const int STAGES>
-void gemv(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch::Tensor sfb, torch::Tensor c);
-
-void gemv_256_16(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch::Tensor sfb, torch::Tensor c)
-{
-    gemv<256, 16, 1, 2>(a, b, sfa, sfb, c);
-}
-
-void gemv_512_8(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch::Tensor sfb, torch::Tensor c)
-{
-    gemv<512, 8, 4, 4>(a, b, sfa, sfb, c);
-}
-"""
-
-gemv_module = load_inline(
-    name='gemv_cuda',
-    cpp_sources=gemv_cpp_src,
-    cuda_sources=gemv_cuda_src,
-    functions=['gemv_256_16', 'gemv_512_8'],
-    verbose=True,
-    extra_cuda_cflags=['-gencode=arch=compute_100a,code=sm_100a']
-)
-
-def gemv(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    sfa: torch.Tensor,
-    sfb: torch.Tensor,
-    c: torch.Tensor,
-) -> torch.Tensor:
-    if a.size(1) == 128:
-        return gemv_module.gemv_256_16(
-            a,
-            b,
-            sfa,
-            sfb,
-            c,
-        )
-    else:
-        return gemv_module.gemv_512_8(
-            a,
-            b,
-            sfa,
-            sfb,
-            c,
-        )
-
-def custom_kernel(data: input_t) -> output_t:
-    """
-    Reference implementation of block-scale fp8 gemv
-    Args:
-        data: Tuple that expands to:
-            a: torch.Tensor[float4e2m1fn] of shape [m, k, l],
-            b: torch.Tensor[float4e2m1fn] of shape [1, k, l],
-            sfa: torch.Tensor[float8_e4m3fnuz] of shape [m, k // 16, l], used by reference implementation
-            sfb: torch.Tensor[float8_e4m3fnuz] of shape [1, k // 16, l], used by reference implementation
-            sfa_permuted: torch.Tensor[float8_e4m3fnuz] of shape [32, 4, rest_m, 4, rest_k, l],
-            sfb_permuted: torch.Tensor[float8_e4m3fnuz] of shape [32, 4, rest_n, 4, rest_k, l],
-            c: torch.Tensor[float16] of shape [m, 1, l]
-    Returns:
-        Tensor containing output in float16
-        c: torch.Tensor[float16] of shape [m, 1, l]
-    """
-    # c: [l, m, 1] is pre-allocated memory to avoid timing allocation overhead.
-    a, b, sfa, sfb, sfa_permuted, sfb_permuted, c = data
-
-    # Your implementation here
-    gemv(a, b, sfa, sfb, c)
-
-    return c
+template void gemv<256, 8, 16, 2>(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch::Tensor sfb, torch::Tensor c);
+template void gemv<512, 4, 8, 2>(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch::Tensor sfb, torch::Tensor c);
