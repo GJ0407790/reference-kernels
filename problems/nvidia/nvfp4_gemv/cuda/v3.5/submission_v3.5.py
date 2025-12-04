@@ -400,8 +400,9 @@ template<
   const int BM_PER_ITER,
   const int BM_ITER,
   const int TK, 
-  const int STAGES>
-__global__ void gemv_kernel_perf(
+  const int STAGES,
+  const int BLOCK_SIZE>
+__launch_bounds__(BLOCK_SIZE) __global__ void gemv_kernel_perf(
   const uint8* __restrict__ a,
   const uint8* __restrict__ b,
   const fp8_e4m3* __restrict__ sfa,
@@ -564,32 +565,60 @@ void gemv_perf(
   const int NUM_THREADS = K / TK;
   
   const dim3 grid(M / BM, B);
-
   const size_t SMEM_SIZE = STAGES * (K / 2 + K / 16); // a + sfa
 
-  if (SMEM_SIZE > 48 * 1024) 
+  auto launch_kernel = [&]<int BLOCK_SIZE>()
   {
-    cudaFuncSetAttribute(
-      gemv_kernel_perf<BM_PER_ITER, BM_ITER, TK, STAGES>,
-      cudaFuncAttributeMaxDynamicSharedMemorySize,
-      SMEM_SIZE
-    );
-  }
+    // Define the specific kernel specialization
+    auto kernel = gemv_kernel_perf<BM_PER_ITER, BM_ITER, TK, STAGES, BLOCK_SIZE>;
 
-  gemv_kernel_perf<BM_PER_ITER, BM_ITER, TK, STAGES><<<grid, NUM_THREADS, SMEM_SIZE>>>(
-    static_cast<uint8*>(a.data_ptr()),
-    static_cast<uint8*>(b.data_ptr()),
-    reinterpret_cast<fp8_e4m3*>(sfa.data_ptr<torch::Float8_e4m3fn>()),
-    reinterpret_cast<fp8_e4m3*>(sfb.data_ptr<torch::Float8_e4m3fn>()),
-    reinterpret_cast<f16*>(c.data_ptr<torch::Half>()),
-    B,
-    M,
-    K,
-    N
-  );
+    // Handle the attribute setting inside the single path
+    if (SMEM_SIZE > 48 * 1024) 
+    {
+      cudaFuncSetAttribute(
+        kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        SMEM_SIZE
+      );
+    }
+
+    // Launch
+    kernel<<<grid, BLOCK_SIZE, SMEM_SIZE>>>(
+      static_cast<uint8*>(a.data_ptr()),
+      static_cast<uint8*>(b.data_ptr()),
+      reinterpret_cast<fp8_e4m3*>(sfa.data_ptr<torch::Float8_e4m3fn>()),
+      reinterpret_cast<fp8_e4m3*>(sfb.data_ptr<torch::Float8_e4m3fn>()),
+      reinterpret_cast<f16*>(c.data_ptr<torch::Half>()),
+      B,
+      M,
+      K,
+      N
+    );
+  };
+
+  if (NUM_THREADS == 2 * 32) // 2048 K
+  {
+    launch_kernel.template operator()<64>();
+  }
+  else if (NUM_THREADS == 3 * 32) // 3072 K
+  {
+    launch_kernel.template operator()<96>();
+  }
+  else if (NUM_THREADS == 4 * 32) // 4096 K
+  {
+    launch_kernel.template operator()<128>();
+  }
+  else if (NUM_THREADS == 7 * 32) // 7168 K
+  {
+    launch_kernel.template operator()<224>();
+  }
+  else if (NUM_THREADS == 16 * 32) // 16384 K
+  {
+    launch_kernel.template operator()<512>();
+  }
 }
 
-template void gemv_perf<16, 2, 16>(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch::Tensor sfb, torch::Tensor c);
+template void gemv_perf<4, 8, 4>(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch::Tensor sfb, torch::Tensor c);
 """
 
 gemv_cpp_src = """
@@ -602,7 +631,7 @@ void gemv_perf(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch::Tenso
 
 void gemv_perf_bm32(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch::Tensor sfb, torch::Tensor c)
 {
-  gemv_perf<16, 2, 16>(a, b, sfa, sfb, c);
+  gemv_perf<4, 8, 4>(a, b, sfa, sfb, c);
 }
 """
 

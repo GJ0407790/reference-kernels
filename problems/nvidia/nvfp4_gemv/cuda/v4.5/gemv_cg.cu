@@ -11,6 +11,49 @@ using f16 = __half;
 using uint8 = uint8_t;
 using fp8_e4m3 = __nv_fp8_e4m3;
 
+__device__ __forceinline__ void cp_async_16B(void* smem_ptr, const void* gmem_ptr) 
+{
+  uint32_t smem_addr = __cvta_generic_to_shared(smem_ptr);
+  uint64_t gmem_addr = __cvta_generic_to_global(gmem_ptr);
+
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 16;"
+               :: "r"(smem_addr), "l"(gmem_addr) : "memory");
+}
+
+__device__ __forceinline__ void cp_async_4B(void* smem_ptr, const void* gmem_ptr) 
+{
+  uint32_t smem_addr = __cvta_generic_to_shared(smem_ptr);
+  uint64_t gmem_addr = __cvta_generic_to_global(gmem_ptr);
+
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 4;"
+               :: "r"(smem_addr), "l"(gmem_addr) : "memory");
+}
+
+__device__ __forceinline__ void cp_async_commit_group()
+{
+  asm volatile("cp.async.commit_group;");
+}
+
+template<int N>
+__device__ __forceinline__ void cp_async_wait_group_impl()
+{
+  asm volatile("cp.async.wait_group %0;" :: "n"(N) : "memory");
+}
+
+__device__ __forceinline__ void cp_async_wait_group(const int N)
+{
+  switch (N) {
+    case 0: cp_async_wait_group_impl<0>(); break;
+    case 1: cp_async_wait_group_impl<1>(); break;
+    case 2: cp_async_wait_group_impl<2>(); break;
+    case 3: cp_async_wait_group_impl<3>(); break;
+    case 4: cp_async_wait_group_impl<4>(); break;
+    case 5: cp_async_wait_group_impl<5>(); break;
+    case 6: cp_async_wait_group_impl<6>(); break;
+    case 7: cp_async_wait_group_impl<7>(); break;
+  }
+}
+
 // src contains 8 fp4 values
 // convert to 4 f16x2 values
 __device__ __forceinline__ void cvt_rn_f16x2_e2m1x2(
@@ -474,20 +517,20 @@ __launch_bounds__(BLOCK_SIZE) __global__ void gemv_kernel_perf(
       {
         const int shared_idx = fetch_batch % STAGES;
 
-        __pipeline_memcpy_async(&a_smem[shared_idx * (K / 2)], a, 16); // load in 16B
+        cp_async_16B(&a_smem[shared_idx * (K / 2)], a); // load in 16B
 
         if (lane_id % 2 == 0) // minimally load in 4B, hence only even lanes load in sfa
         {
-          __pipeline_memcpy_async(&sfa_smem[shared_idx * (K / 16)], sfa, 4);
+          cp_async_4B(&sfa_smem[shared_idx * (K / 16)], sfa);
         }
 
-        __pipeline_commit();
+        cp_async_commit_group();
 
         a += K / 2;
         sfa += K / 16;
       }
 
-      __pipeline_wait_prior(fetch_batch - compute_batch - 1);
+      cp_async_wait_group(STAGES - 1);
       __syncwarp(); // for sfa
 
       const int shared_idx = compute_batch % STAGES;
@@ -496,7 +539,6 @@ __launch_bounds__(BLOCK_SIZE) __global__ void gemv_kernel_perf(
 
       // fma here
       Reg32* a_reg32_ptr = reinterpret_cast<Reg32*>(&a_reg);
-      Reg32* b_reg32_ptr = reinterpret_cast<Reg32*>(&b_reg);
 
       f16 res = blockscaled_multiply_add(
                   a_reg32_ptr[0], a_reg32_ptr[1], a_reg32_ptr[2], a_reg32_ptr[3],

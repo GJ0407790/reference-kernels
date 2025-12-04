@@ -1,3 +1,8 @@
+import torch
+from torch.utils.cpp_extension import load_inline
+from task import input_t, output_t
+
+gemv_cuda_src = """
 #include <torch/extension.h>
 
 #include <cuda_fp16.h>
@@ -10,6 +15,49 @@ using Reg16 = uint16_t;
 using f16 = __half;
 using uint8 = uint8_t;
 using fp8_e4m3 = __nv_fp8_e4m3;
+
+__device__ __forceinline__ void cp_async_16B(void* smem_ptr, const void* gmem_ptr) 
+{
+  uint32_t smem_addr = __cvta_generic_to_shared(smem_ptr);
+  uint64_t gmem_addr = __cvta_generic_to_global(gmem_ptr);
+
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 16;"
+               :: "r"(smem_addr), "l"(gmem_addr) : "memory");
+}
+
+__device__ __forceinline__ void cp_async_4B(void* smem_ptr, const void* gmem_ptr) 
+{
+  uint32_t smem_addr = __cvta_generic_to_shared(smem_ptr);
+  uint64_t gmem_addr = __cvta_generic_to_global(gmem_ptr);
+
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 4;"
+               :: "r"(smem_addr), "l"(gmem_addr) : "memory");
+}
+
+__device__ __forceinline__ void cp_async_commit_group()
+{
+  asm volatile("cp.async.commit_group;");
+}
+
+template<int N>
+__device__ __forceinline__ void cp_async_wait_group_impl()
+{
+  asm volatile("cp.async.wait_group %0;" :: "n"(N) : "memory");
+}
+
+__device__ __forceinline__ void cp_async_wait_group(const int N)
+{
+  switch (N) {
+    case 0: cp_async_wait_group_impl<0>(); break;
+    case 1: cp_async_wait_group_impl<1>(); break;
+    case 2: cp_async_wait_group_impl<2>(); break;
+    case 3: cp_async_wait_group_impl<3>(); break;
+    case 4: cp_async_wait_group_impl<4>(); break;
+    case 5: cp_async_wait_group_impl<5>(); break;
+    case 6: cp_async_wait_group_impl<6>(); break;
+    case 7: cp_async_wait_group_impl<7>(); break;
+  }
+}
 
 // src contains 8 fp4 values
 // convert to 4 f16x2 values
@@ -397,7 +445,7 @@ template<
   const int TK, 
   const int STAGES,
   const int BLOCK_SIZE>
-__launch_bounds__(BLOCK_SIZE) __global__ void gemv_kernel_perf(
+__launch_bounds__(BLOCK_SIZE, 1, 1) __global__ void gemv_kernel_perf(
   const uint8* __restrict__ a,
   const uint8* __restrict__ b,
   const fp8_e4m3* __restrict__ sfa,
@@ -474,20 +522,20 @@ __launch_bounds__(BLOCK_SIZE) __global__ void gemv_kernel_perf(
       {
         const int shared_idx = fetch_batch % STAGES;
 
-        __pipeline_memcpy_async(&a_smem[shared_idx * (K / 2)], a, 16); // load in 16B
+        cp_async_16B(&a_smem[shared_idx * (K / 2)], a); // load in 16B
 
         if (lane_id % 2 == 0) // minimally load in 4B, hence only even lanes load in sfa
         {
-          __pipeline_memcpy_async(&sfa_smem[shared_idx * (K / 16)], sfa, 4);
+          cp_async_4B(&sfa_smem[shared_idx * (K / 16)], sfa);
         }
 
-        __pipeline_commit();
+        cp_async_commit_group();
 
         a += K / 2;
         sfa += K / 16;
       }
 
-      __pipeline_wait_prior(fetch_batch - compute_batch - 1);
+      cp_async_wait_group(fetch_batch - compute_batch - 1);
       __syncwarp(); // for sfa
 
       const int shared_idx = compute_batch % STAGES;
@@ -613,4 +661,76 @@ void gemv_perf(
   }
 }
 
-template void gemv_perf<8, 4, 8>(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch::Tensor sfb, torch::Tensor c);
+template void gemv_perf<4, 4, 4>(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch::Tensor sfb, torch::Tensor c);
+"""
+
+gemv_cpp_src = """
+#include <torch/extension.h>
+
+void gemv_safe(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch::Tensor sfb, torch::Tensor c);
+
+template<const int BM_PER_ITER, const int BM_ITER, const int STAGES>
+void gemv_perf(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch::Tensor sfb, torch::Tensor c);
+
+void gemv_perf_bm32(torch::Tensor a, torch::Tensor b, torch::Tensor sfa, torch::Tensor sfb, torch::Tensor c)
+{
+  gemv_perf<4, 4, 4>(a, b, sfa, sfb, c);
+}
+"""
+
+gemv_module = load_inline(
+    name='gemv_cuda',
+    cpp_sources=gemv_cpp_src,
+    cuda_sources=gemv_cuda_src,
+    functions=['gemv_safe', 'gemv_perf_bm32'],
+    verbose=True,
+    extra_cuda_cflags=['-lineinfo', '-gencode=arch=compute_100a,code=sm_100a']
+)
+
+def gemv(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    sfa: torch.Tensor,
+    sfb: torch.Tensor,
+    c: torch.Tensor,
+) -> torch.Tensor:
+    if a.size(1) % 1024 != 0:
+        return gemv_module.gemv_safe(
+            a,
+            b,
+            sfa,
+            sfb,
+            c,
+        )
+  
+    return gemv_module.gemv_perf_bm32(
+        a,
+        b,
+        sfa,
+        sfb,
+        c,
+    )
+
+def custom_kernel(data: input_t) -> output_t:
+    """
+    Reference implementation of block-scale fp8 gemv
+    Args:
+        data: Tuple that expands to:
+            a: torch.Tensor[float4e2m1fn] of shape [m, k, l],
+            b: torch.Tensor[float4e2m1fn] of shape [1, k, l],
+            sfa: torch.Tensor[float8_e4m3fnuz] of shape [m, k // 16, l], used by reference implementation
+            sfb: torch.Tensor[float8_e4m3fnuz] of shape [1, k // 16, l], used by reference implementation
+            sfa_permuted: torch.Tensor[float8_e4m3fnuz] of shape [32, 4, rest_m, 4, rest_k, l],
+            sfb_permuted: torch.Tensor[float8_e4m3fnuz] of shape [32, 4, rest_n, 4, rest_k, l],
+            c: torch.Tensor[float16] of shape [m, 1, l]
+    Returns:
+        Tensor containing output in float16
+        c: torch.Tensor[float16] of shape [m, 1, l]
+    """
+    # c: [l, m, 1] is pre-allocated memory to avoid timing allocation overhead.
+    a, b, sfa, sfb, sfa_permuted, sfb_permuted, c = data
+
+    # Your implementation here
+    gemv(a, b, sfa, sfb, c)
+
+    return c
